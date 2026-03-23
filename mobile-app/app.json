@@ -1,0 +1,67 @@
+{
+  "expo": {
+    "name": "BFP Attendance",
+    "slug": "mobile-app",
+    "version": "1.0.1",
+    "backgroundColor": "#ffffff",
+    "orientation": "portrait",
+    "icon": "./assets/mandabfplogo.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/mandabfplogo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "versionCode": 2,
+      "adaptiveIcon": {
+        "backgroundColor": "#ffffff",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "monochromeImage": "./assets/mandabfplogo.png"
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ],
+      "predictiveBackGestureEnabled": false,
+      "package": "com.kailaxy.mobileapp"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "8f770daf-19fd-4b7e-9d09-4c8e6fb158bb"
+      }
+    },
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/8f770daf-19fd-4b7e-9d09-4c8e6fb158bb"
+    },
+    "plugins": [
+      [
+        "expo-splash-screen",
+        {
+          "backgroundColor": "#ffffff",
+          "image": "./assets/mandabfplogo.png",
+          "imageWidth": 180,
+          "dark": {
+            "backgroundColor": "#ffffff",
+            "image": "./assets/mandabfplogo.png"
+          }
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow BFP Attendance to access your location while scanning to verify on-site attendance."
+        }
+      ]
+    ]
+  }
+}

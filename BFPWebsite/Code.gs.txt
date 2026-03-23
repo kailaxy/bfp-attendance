@@ -1,0 +1,1642 @@
+/**
+ * Code.gs - Attendance scanner backend
+ * FIX: Receives Profile Data directly from Client to ensure what is seen is what is saved.
+ */
+
+var SHEET_NAMES = {
+  profile: 'ReferenceProfile',
+  leave: 'LeavePersonnel',
+  rawLog: 'Attendance_Raw_Log',
+  archive: 'Attendance_Archive',
+};
+
+var RAW_LOG_COLUMNS = {
+  id: 1,
+  timeIn: 2,
+  timeOut: 3,
+  remarks: 4,
+  image: 5,
+  unit: 6,
+  adminOp: 7,
+  rank: 8,
+  name: 9,
+};
+var RAW_LOCATION_COLUMNS = {
+  location: 11,
+};
+
+var PROFILE_COLUMNS = {
+  accountNumber: 0,
+  rank: 1,
+  lastName: 2,
+  firstName: 3,
+  middleName: 4,
+  suffix: 5,
+  unit: 6,
+  adminOp: 7,
+  photoUrl: 9,
+};
+
+var CACHE_KEYS = {
+  profileLookup: 'attendance_profile_lookup_v1',
+  mergedLogs: 'attendance_merged_logs_v1',
+  rawLogs: 'attendance_raw_logs_v1',
+  archiveLogs: 'attendance_archive_logs_v1',
+};
+
+var CACHE_TTL_SECONDS = {
+  profileLookup: 120,
+  logs: 10,
+};
+
+function normalizeAccountNumber(value) {
+  return String(value || '').replace(/\s+/g, '').toLowerCase();
+}
+
+function normalizeLookupToken(value) {
+  return String(value || '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/[^a-zA-Z0-9]/g, '')
+    .toLowerCase();
+}
+
+function normalizeHeaderKey(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function getProfileColumnIndexes(profileData) {
+  if (!profileData || profileData.length === 0) {
+    return {
+      accountNumber: PROFILE_COLUMNS.accountNumber,
+      rank: PROFILE_COLUMNS.rank,
+      lastName: PROFILE_COLUMNS.lastName,
+      firstName: PROFILE_COLUMNS.firstName,
+      middleName: PROFILE_COLUMNS.middleName,
+      designation: PROFILE_COLUMNS.suffix,
+      unit: PROFILE_COLUMNS.unit,
+      adminOp: PROFILE_COLUMNS.adminOp,
+      qrCode: 8,
+      photoUrl: PROFILE_COLUMNS.photoUrl,
+    };
+  }
+
+  var headers = profileData[0].map(normalizeHeaderKey);
+  var indexOf = function (candidates, fallback) {
+    for (var i = 0; i < headers.length; i += 1) {
+      for (var j = 0; j < candidates.length; j += 1) {
+        if (headers[i] === candidates[j]) {
+          return i;
+        }
+      }
+    }
+    return fallback;
+  };
+
+  return {
+    accountNumber: indexOf(['account number', 'account no', 'account'], PROFILE_COLUMNS.accountNumber),
+    rank: indexOf(['rank'], PROFILE_COLUMNS.rank),
+    lastName: indexOf(['last name', 'surname'], PROFILE_COLUMNS.lastName),
+    firstName: indexOf(['first name', 'given name'], PROFILE_COLUMNS.firstName),
+    middleName: indexOf(['middle name', 'middle initial'], PROFILE_COLUMNS.middleName),
+    designation: indexOf(['primary designation', 'designation', 'suffix'], PROFILE_COLUMNS.suffix),
+    unit: indexOf(['unit'], PROFILE_COLUMNS.unit),
+    adminOp: indexOf(['op and admin', 'admin operation', 'admin op'], PROFILE_COLUMNS.adminOp),
+    qrCode: indexOf(['qr code'], 8),
+    photoUrl: indexOf(['imagepfp', 'photo url', 'photo_url', 'image'], PROFILE_COLUMNS.photoUrl),
+  };
+}
+
+function getGmt8DayKey(date) {
+  return Utilities.formatDate(date || new Date(), 'GMT+8', 'yyyy-MM-dd');
+}
+
+function toIsoStringOrEmpty(value) {
+  if (!(value instanceof Date) || isNaN(value.getTime())) {
+    return '';
+  }
+  return value.toISOString();
+}
+
+function buildDisplayName(profile) {
+  return [profile.rank, profile.lastName, profile.firstName]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+}
+
+function getScriptCache() {
+  return CacheService.getScriptCache();
+}
+
+function cacheGetJson(key) {
+  if (!key) return null;
+
+  try {
+    var raw = getScriptCache().get(key);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
+}
+
+function cachePutJson(key, value, ttlSeconds) {
+  if (!key) return;
+
+  try {
+    var payload = JSON.stringify(value);
+    getScriptCache().put(key, payload, ttlSeconds || 60);
+  } catch (error) {
+    // Ignore cache failures to avoid impacting API behavior.
+  }
+}
+
+function invalidateLogsCache() {
+  try {
+    var cache = getScriptCache();
+    cache.remove(CACHE_KEYS.mergedLogs + '_source_all');
+    cache.remove(CACHE_KEYS.mergedLogs + '_source_raw');
+    cache.remove(CACHE_KEYS.mergedLogs + '_source_archive');
+  } catch (error) {
+    // Ignore cache invalidation errors.
+  }
+}
+
+function normalizeLogTimestamp(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) {
+    return value.toISOString();
+  }
+
+  var text = String(value || '').trim();
+  if (!text) return '';
+
+  var parsed = new Date(text);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString();
+  }
+
+  return text;
+}
+
+function getProfileLookup() {
+  var cached = cacheGetJson(CACHE_KEYS.profileLookup);
+  if (cached && cached.items && cached.items.length > 0) {
+    return cached;
+  }
+
+  var ss = getSpreadsheet();
+  var profileSheet = ss.getSheetByName(SHEET_NAMES.profile);
+  if (!profileSheet) {
+    return {
+      items: [],
+      byAccount: {},
+      byToken: {},
+      samples: [],
+      profileColumns: getProfileColumnIndexes([]),
+    };
+  }
+
+  var profileData = profileSheet.getDataRange().getDisplayValues();
+  var profileColumns = getProfileColumnIndexes(profileData);
+
+  var items = [];
+  var byAccount = {};
+  var byToken = {};
+  var samples = [];
+
+  for (var i = 1; i < profileData.length; i += 1) {
+    var accountNumber = String(profileData[i][profileColumns.accountNumber] || '').trim();
+    if (!accountNumber) {
+      continue;
+    }
+
+    var qrCodeValue = String(profileData[i][profileColumns.qrCode] || '').trim();
+    var accountNormalized = normalizeAccountNumber(accountNumber);
+    var accountToken = normalizeLookupToken(accountNumber);
+    var qrToken = normalizeLookupToken(qrCodeValue);
+
+    var profile = {
+      accountNumber: accountNumber,
+      rank: String(profileData[i][profileColumns.rank] || '').trim(),
+      lastName: String(profileData[i][profileColumns.lastName] || '').trim(),
+      firstName: String(profileData[i][profileColumns.firstName] || '').trim(),
+      middleName: String(profileData[i][profileColumns.middleName] || '').trim(),
+      suffix: String(profileData[i][profileColumns.designation] || '').trim(),
+      units: String(profileData[i][profileColumns.unit] || '').trim(),
+      adminOp: String(profileData[i][profileColumns.adminOp] || '').trim(),
+      photoUrl: String(profileData[i][profileColumns.photoUrl] || '').trim(),
+      accountNormalized: accountNormalized,
+      accountToken: accountToken,
+      qrToken: qrToken,
+    };
+
+    profile.fullName = buildDisplayName(profile) || profile.lastName || 'Unknown Personnel';
+
+    if (samples.length < 5) {
+      samples.push(accountNumber);
+    }
+
+    items.push(profile);
+
+    if (accountNormalized) {
+      byAccount[accountNormalized] = profile;
+    }
+
+    if (accountToken) {
+      byToken[accountToken] = profile;
+    }
+
+    if (qrToken) {
+      byToken[qrToken] = profile;
+    }
+  }
+
+  var lookup = {
+    items: items,
+    byAccount: byAccount,
+    byToken: byToken,
+    samples: samples,
+    profileColumns: profileColumns,
+  };
+
+  cachePutJson(CACHE_KEYS.profileLookup, lookup, CACHE_TTL_SECONDS.profileLookup);
+  return lookup;
+}
+
+function findProfileInLookup(lookup, scannedId, scannedToken) {
+  if (!lookup) return null;
+
+  if (lookup.byAccount && lookup.byAccount[scannedId]) {
+    return lookup.byAccount[scannedId];
+  }
+
+  if (lookup.byToken && scannedToken && lookup.byToken[scannedToken]) {
+    return lookup.byToken[scannedToken];
+  }
+
+  var items = Array.isArray(lookup.items) ? lookup.items : [];
+  for (var i = 0; i < items.length; i += 1) {
+    var profile = items[i];
+    var accountToken = String(profile.accountToken || '');
+    var qrToken = String(profile.qrToken || '');
+
+    var looseAccountMatch =
+      scannedToken && accountToken && (scannedToken.includes(accountToken) || accountToken.includes(scannedToken));
+
+    var looseQrMatch =
+      scannedToken && qrToken && (scannedToken.includes(qrToken) || qrToken.includes(scannedToken));
+
+    if (looseAccountMatch || looseQrMatch) {
+      return profile;
+    }
+  }
+
+  return null;
+}
+
+function doGet(e) {
+  try {
+    const route = getRequestRoute(e);
+
+    if (route === '/logs') {
+      const source = normalizeLogsSourceParam(e && e.parameter ? e.parameter.source : '');
+      var items = [];
+
+      if (source === 'raw') {
+        const rawLogs = getRawAttendanceLogs();
+        items = transformLogsToApiItems(rawLogs, 'raw');
+        sortLogsByTimestampDesc(items);
+      } else if (source === 'archive') {
+        const archiveLogs = getAttendanceLogs();
+        items = transformLogsToApiItems(archiveLogs, 'archive');
+        sortLogsByTimestampDesc(items);
+      } else {
+        const rawLogs = getRawAttendanceLogs();
+        const archiveLogs = getAttendanceLogs();
+        items = transformLogsToApiItems(rawLogs, 'raw').concat(
+          transformLogsToApiItems(archiveLogs, 'archive')
+        );
+        sortLogsByTimestampDesc(items);
+      }
+
+      return jsonSuccess(
+        {
+          items: items,
+          total: items.length,
+        },
+        {
+          items: items,
+          total: items.length,
+        }
+      );
+    }
+
+    if (route === '/personnel') {
+      const personnel = getPersonnelRecords();
+      const personnelItems = transformPersonnelToApiItems(personnel);
+      return jsonSuccess(
+        {
+          items: personnelItems,
+          total: personnelItems.length,
+        },
+        {
+          items: personnelItems,
+          total: personnelItems.length,
+        }
+      );
+    }
+
+    if (route === '/leaves') {
+      const leaves = getLeaveRecords();
+      const leaveItems = transformLeavesToApiItems(leaves);
+      return jsonSuccess(
+        {
+          items: leaveItems,
+          total: leaveItems.length,
+        },
+        {
+          items: leaveItems,
+          total: leaveItems.length,
+        }
+      );
+    }
+
+    if (route === '/sync') {
+      return handleSyncRequest(e && e.parameter ? e.parameter : {});
+    }
+
+    if (route === '/health' || route === '/meta') {
+      return jsonSuccess(
+        {
+          service: 'attendance-api',
+          version: '2.1.0',
+          routes: {
+            get: ['/logs', '/personnel', '/leaves', '/sync', '/health', '/meta'],
+            post: ['/scan', '/scan/batch', '/commit-scan'],
+          },
+          sheets: {
+            rawLog: 'Attendance_Raw_Log',
+            archive: 'Attendance_Archive',
+            profile: 'ReferenceProfile',
+            leave: 'LeavePersonnel',
+          },
+        },
+        {
+          service: 'attendance-api',
+          version: '2.1.0',
+        }
+      );
+    }
+
+    return jsonError('NOT_FOUND', 'Route not found for GET request.', {
+      route: route,
+      supportedRoutes: ['/logs', '/personnel', '/leaves', '/sync', '/health', '/meta'],
+    });
+  } catch (error) {
+    return jsonError('INTERNAL_ERROR', 'Failed to process GET request.', {
+      message: String(error),
+    });
+  }
+}
+
+function doPost(e) {
+  try {
+    const route = getRequestRoute(e);
+
+    if (route !== '/scan' && route !== '/scan/batch' && route !== '/commit-scan') {
+      return jsonError('NOT_FOUND', 'Route not found for POST request.', {
+        route: route,
+        supportedRoutes: ['/scan', '/scan/batch', '/commit-scan'],
+      });
+    }
+
+    const payload = parseRequestJson(e);
+    if (!payload.ok) {
+      return jsonError('INVALID_JSON', payload.message, payload.details);
+    }
+
+    if (route === '/scan/batch') {
+      return handleBatchScanRequest(payload.data);
+    }
+
+    if (route === '/commit-scan') {
+      return handleCommitScanRequest(payload.data);
+    }
+
+    const result = executeScanPayload(payload.data);
+    if (!result.ok) {
+      return jsonError(result.error.code, result.error.message, result.error.details);
+    }
+
+    return jsonSuccess(result.data, result.data);
+  } catch (error) {
+    return jsonError('INTERNAL_ERROR', 'Failed to process POST request.', {
+      message: String(error),
+    });
+  }
+}
+
+function getCommitEventStore() {
+  return PropertiesService.getScriptProperties();
+}
+
+function getCommitEventStorageKey(eventId) {
+  return 'commit_event_' + String(eventId || '').trim();
+}
+
+function getStoredCommitEvent(eventId) {
+  var key = getCommitEventStorageKey(eventId);
+  if (!key || key === 'commit_event_') {
+    return null;
+  }
+
+  try {
+    var raw = getCommitEventStore().getProperty(key);
+    if (!raw) return null;
+    var parsed = JSON.parse(raw);
+    if (!parsed || !parsed.data) return null;
+    return parsed.data;
+  } catch (error) {
+    return null;
+  }
+}
+
+function setStoredCommitEvent(eventId, data) {
+  var key = getCommitEventStorageKey(eventId);
+  if (!key || key === 'commit_event_') {
+    return;
+  }
+
+  var payload = {
+    storedAt: new Date().toISOString(),
+    data: data,
+  };
+
+  getCommitEventStore().setProperty(key, JSON.stringify(payload));
+}
+
+function handleCommitScanRequest(scanPayload) {
+  var clientEventId = String(
+    (scanPayload && (scanPayload.clientEventId || scanPayload.eventId || scanPayload.idempotencyKey)) || ''
+  ).trim();
+
+  if (clientEventId) {
+    var stored = getStoredCommitEvent(clientEventId);
+    if (stored) {
+      return jsonSuccess(stored, stored);
+    }
+  }
+
+  var lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+
+  try {
+    var result = executeScanPayload(scanPayload);
+    if (!result.ok) {
+      return jsonError(result.error.code, result.error.message, result.error.details);
+    }
+
+    if (clientEventId) {
+      setStoredCommitEvent(clientEventId, result.data);
+    }
+
+    return jsonSuccess(result.data, result.data);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function handleBatchScanRequest(requestData) {
+  const items = Array.isArray(requestData && requestData.items)
+    ? requestData.items
+    : Array.isArray(requestData)
+      ? requestData
+      : null;
+
+  if (!items || items.length === 0) {
+    return jsonError('VALIDATION_ERROR', 'Batch payload must include a non-empty items array.', {
+      expectedShape: {
+        items: [
+          {
+            qrCode: 'string',
+            scannedAt: 'ISO date (optional)',
+          },
+        ],
+      },
+    });
+  }
+
+  const results = [];
+  let successCount = 0;
+
+  items.forEach(function (item, index) {
+    const result = executeScanPayload(item);
+    if (result.ok) {
+      successCount += 1;
+      results.push({
+        index: index,
+        qrCode: String(item && item.qrCode ? item.qrCode : ''),
+        ok: true,
+        data: result.data,
+      });
+      return;
+    }
+
+    results.push({
+      index: index,
+      qrCode: String(item && item.qrCode ? item.qrCode : ''),
+      ok: false,
+      error: result.error,
+    });
+  });
+
+  const responseData = {
+    items: results,
+    total: results.length,
+    successCount: successCount,
+    failedCount: results.length - successCount,
+  };
+
+  return jsonSuccess(responseData, responseData);
+}
+
+function executeScanPayload(scanPayload) {
+  if (!scanPayload || typeof scanPayload !== 'object' || Array.isArray(scanPayload)) {
+    return {
+      ok: false,
+      error: {
+        code: 'MALFORMED_PAYLOAD',
+        message: 'Request body must be a JSON object.',
+        details: {
+          receivedType: typeof scanPayload,
+        },
+      },
+    };
+  }
+
+  const scannedId = String(
+    scanPayload.qrCode || scanPayload.userId || scanPayload.id || ''
+  ).trim();
+
+  if (!scannedId) {
+    return {
+      ok: false,
+      error: {
+        code: 'VALIDATION_ERROR',
+        message: 'Missing scanned ID in payload.',
+        details: {
+          acceptedFields: ['qrCode', 'userId', 'id'],
+        },
+      },
+    };
+  }
+
+  let userCheck = checkUserV2(scannedId, false);
+
+  if (!userCheck || !userCheck.exists) {
+    const fallbackProfile = findProfileForScanV3(scannedId);
+    if (fallbackProfile) {
+      userCheck = {
+        exists: true,
+        accountNumber: fallbackProfile.accountNumber,
+        profile: fallbackProfile,
+        hasTimeIn: false,
+        hasTimeOut: false,
+        timeIn: null,
+        dailyScanCount: 0,
+      };
+    }
+  }
+
+  if (userCheck.error) {
+    return {
+      ok: false,
+      error: {
+        code: 'USER_CHECK_FAILED',
+        message: userCheck.error,
+        details: {
+          personnelId: scannedId,
+        },
+      },
+    };
+  }
+
+  if (!userCheck.exists) {
+    return {
+      ok: false,
+      error: {
+        code: 'USER_NOT_FOUND',
+        message: userCheck.error || 'Personnel not found.',
+        details: {
+          personnelId: scannedId,
+          debug: userCheck.details || {
+            marker: 'checkUserV2_no_debug_details',
+          },
+        },
+      },
+    };
+  }
+
+  const scanLocation = extractScanLocationMetadata(scanPayload);
+  const attendanceResult = logAttendance(userCheck.accountNumber, userCheck.profile, scanLocation);
+
+  if (!attendanceResult.ok) {
+    return {
+      ok: false,
+      error: {
+        code: attendanceResult.code,
+        message: attendanceResult.message,
+        details: attendanceResult.details,
+      },
+    };
+  }
+
+  const timestamp =
+    attendanceResult.time || scanPayload.scannedAt || new Date().toISOString();
+
+  const responseData = {
+    success: true,
+    message: attendanceResult.message,
+    referenceId: attendanceResult.referenceId,
+    timestamp: timestamp,
+    attendee: {
+      personnelId: userCheck.accountNumber,
+      accountNumber: userCheck.accountNumber,
+      name: userCheck.profile.fullName,
+      firstName: userCheck.profile.firstName,
+      lastName: userCheck.profile.lastName,
+      rank: userCheck.profile.rank,
+      unit: userCheck.profile.units,
+      adminOp: userCheck.profile.adminOp,
+      photoUrl: userCheck.profile.photoUrl,
+      status: attendanceResult.status,
+    },
+    action: attendanceResult.action,
+    profile: {
+      accountNumber: userCheck.accountNumber,
+      firstName: userCheck.profile.firstName,
+      lastName: userCheck.profile.lastName,
+      rank: userCheck.profile.rank,
+      fullName: userCheck.profile.fullName,
+      unit: userCheck.profile.units,
+      adminOp: userCheck.profile.adminOp,
+      photoUrl: userCheck.profile.photoUrl,
+      status: attendanceResult.status,
+    },
+    scanLocation: scanLocation,
+  };
+
+  return {
+    ok: true,
+    data: responseData,
+  };
+}
+
+function toNumberOrNull(value) {
+  var parsed = Number(value);
+  return isNaN(parsed) ? null : parsed;
+}
+
+function extractScanLocationMetadata(scanPayload) {
+  var metadata = scanPayload && typeof scanPayload.metadata === 'object' && scanPayload.metadata
+    ? scanPayload.metadata
+    : {};
+
+  var latitude = toNumberOrNull(metadata.scanLatitude);
+  var longitude = toNumberOrNull(metadata.scanLongitude);
+  var permissionGranted = metadata.locationPermissionGranted;
+  var unavailableReason = String(metadata.locationUnavailableReason || '').trim();
+
+  var locationLabel = '';
+  if (latitude !== null && longitude !== null) {
+    locationLabel = Number(latitude).toFixed(7) + ', ' + Number(longitude).toFixed(7);
+  }
+
+  return {
+    locationLabel: locationLabel,
+    permissionGranted: permissionGranted === true,
+    unavailableReason: unavailableReason,
+  };
+}
+
+function ensureRawLocationHeaders(sheet) {
+  if (!sheet) return;
+
+  var headerCell = sheet.getRange(1, RAW_LOCATION_COLUMNS.location);
+  var existing = String(headerCell.getDisplayValue() || '').trim();
+  if (!existing) {
+    headerCell.setValue('Scan Location');
+  }
+}
+
+function writeScanLocationToRawRow(sheet, rowIndex, action, scanLocation) {
+  if (!sheet || !rowIndex) return;
+
+  ensureRawLocationHeaders(sheet);
+
+  var locationValue = scanLocation && scanLocation.locationLabel
+    ? String(scanLocation.locationLabel).trim()
+    : '';
+
+  var values = [[locationValue]];
+
+  sheet
+    .getRange(rowIndex, RAW_LOCATION_COLUMNS.location, 1, 1)
+    .setValues(values);
+}
+
+function getRequestRoute(e) {
+  const pathInfo = e && e.pathInfo ? String(e.pathInfo).trim() : '';
+  if (pathInfo) {
+    return normalizeRoute(pathInfo);
+  }
+
+  const routeParam = e && e.parameter ? e.parameter.route || e.parameter.action || '' : '';
+  return normalizeRoute(routeParam || '/health');
+}
+
+function normalizeRoute(route) {
+  const value = String(route || '').trim();
+  if (!value) return '/health';
+  return value.startsWith('/') ? value : '/' + value;
+}
+
+function parseRequestJson(e) {
+  try {
+    const rawBody = e && e.postData && typeof e.postData.contents === 'string'
+      ? e.postData.contents
+      : '';
+
+    if (!rawBody) {
+      return { ok: false, message: 'Request body is empty.', details: null };
+    }
+
+    return { ok: true, data: JSON.parse(rawBody) };
+  } catch (error) {
+    return {
+      ok: false,
+      message: 'Request body is not valid JSON.',
+      details: String(error),
+    };
+  }
+}
+
+function createEnvelope(status, message, data, error) {
+  return {
+    status: status,
+    success: status === 'success',
+    message: message,
+    data: data || null,
+    error: error || null,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function jsonSuccess(data, compatibilityFields) {
+  const envelope = createEnvelope('success', 'Request completed successfully.', data, null);
+  const payload = Object.assign({}, envelope, compatibilityFields || {});
+  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function jsonError(code, message, details) {
+  const envelope = createEnvelope('error', message, null, {
+    code: code,
+    message: message,
+    details: details || null,
+  });
+  const payload = Object.assign({}, envelope, {
+    code: code,
+  });
+  return ContentService.createTextOutput(JSON.stringify(payload)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function normalizeLogsSourceParam(value) {
+  var source = String(value || '').trim().toLowerCase();
+  if (source === 'raw') return 'raw';
+  if (source === 'archive') return 'archive';
+  return '';
+}
+
+function parseSyncCursor(value) {
+  var text = String(value || '').trim();
+  if (!text) return 0;
+
+  var parsedNumber = Number(text);
+  if (!isNaN(parsedNumber) && parsedNumber > 0) {
+    return Math.floor(parsedNumber);
+  }
+
+  var parsedDate = new Date(text).getTime();
+  if (!isNaN(parsedDate) && parsedDate > 0) {
+    return parsedDate;
+  }
+
+  return 0;
+}
+
+function parseSyncLimit(value) {
+  var parsed = Number(value);
+  if (!isFinite(parsed) || parsed <= 0) {
+    return 200;
+  }
+  return Math.min(1000, Math.floor(parsed));
+}
+
+function handleSyncRequest(params) {
+  var cursor = parseSyncCursor(params && params.cursor);
+  var limit = parseSyncLimit(params && params.limit);
+  var source = normalizeLogsSourceParam(params && params.source);
+
+  var includeRaw = source !== 'archive';
+  var includeArchive = source !== 'raw';
+
+  var cacheKey =
+    CACHE_KEYS.mergedLogs +
+    '_source_' +
+    (source || 'all');
+
+  var mergedItems = cacheGetJson(cacheKey);
+
+  if (!Array.isArray(mergedItems)) {
+    var combined = [];
+
+    if (includeRaw) {
+      combined = combined.concat(transformLogsToApiItems(getRawAttendanceLogs(), 'raw'));
+    }
+
+    if (includeArchive) {
+      combined = combined.concat(transformLogsToApiItems(getAttendanceLogs(), 'archive'));
+    }
+
+    mergedItems = combined;
+    cachePutJson(cacheKey, mergedItems, CACHE_TTL_SECONDS.logs);
+  }
+
+  var filtered = mergedItems.filter(function (item) {
+    var ts = new Date(item.timestamp || '').getTime();
+    if (isNaN(ts)) return false;
+    return ts > cursor;
+  });
+
+  sortLogsByTimestampDesc(filtered);
+  var changes = filtered.slice(0, limit);
+
+  var nextCursor = cursor;
+  changes.forEach(function (item) {
+    var ts = new Date(item.timestamp || '').getTime();
+    if (!isNaN(ts) && ts > nextCursor) {
+      nextCursor = ts;
+    }
+  });
+
+  var responseData = {
+    cursor: String(nextCursor),
+    serverTime: new Date().toISOString(),
+    hasMore: filtered.length > changes.length,
+    changes: {
+      logs: changes,
+    },
+  };
+
+  return jsonSuccess(responseData, responseData);
+}
+
+function sortLogsByTimestampDesc(items) {
+  items.sort(function (a, b) {
+    var aTime = new Date(a.timestamp || '').getTime();
+    var bTime = new Date(b.timestamp || '').getTime();
+    if (isNaN(aTime) && isNaN(bTime)) return 0;
+    if (isNaN(aTime)) return 1;
+    if (isNaN(bTime)) return -1;
+    return bTime - aTime;
+  });
+}
+
+function normalizeLogStatusForApi(remarks, hasTimeOut) {
+  var raw = String(remarks || '').trim();
+  var normalized = raw.toLowerCase();
+
+  if (normalized === 'on-duty' || normalized === 'onduty') return 'IN';
+  if (normalized === 'off-duty' || normalized === 'offduty') return 'OUT';
+  if (normalized === 'in' || normalized === 'time-in' || normalized === 'timein') return 'IN';
+  if (normalized === 'out' || normalized === 'time-out' || normalized === 'timeout') return 'OUT';
+
+  if (raw) return raw;
+  return hasTimeOut ? 'OUT' : 'IN';
+}
+
+function transformLogsToApiItems(rows, sourceType) {
+  var source = String(sourceType || '').toLowerCase() === 'raw' ? 'raw' : 'archive';
+  var lookup = getProfileLookup();
+
+  return rows.map(function (row, index) {
+    var recordId = row[0] || source + '-' + (index + 1);
+    var personnelId = '';
+    var timeIn = '';
+    var timeOut = '';
+    var remarks = '';
+    var unit = '';
+    var rank = '';
+    var name = '';
+    var scanLocation = '';
+
+    if (source === 'raw') {
+      personnelId = String(row[1] || '');
+      timeIn = normalizeLogTimestamp(row[2]);
+      timeOut = normalizeLogTimestamp(row[3]);
+      remarks = String(row[4] || '');
+      unit = String(row[6] || '');
+      rank = String(row[8] || '');
+      name = String(row[9] || '');
+      scanLocation = String(row[10] || '').trim();
+    } else {
+      personnelId = String(row[1] || '');
+      timeIn = normalizeLogTimestamp(row[2]);
+      timeOut = normalizeLogTimestamp(row[3]);
+      remarks = String(row[4] || '');
+      unit = String(row[5] || '');
+      rank = String(row[7] || '');
+      name = String(row[8] || '');
+      scanLocation = String(row[10] || '').trim();
+    }
+
+    var scannedId = normalizeAccountNumber(personnelId);
+    var scannedToken = normalizeLookupToken(personnelId);
+    var matchedProfile = findProfileInLookup(lookup, scannedId, scannedToken);
+
+    var firstName = matchedProfile ? String(matchedProfile.firstName || '').trim() : '';
+    var lastName = matchedProfile ? String(matchedProfile.lastName || '').trim() : '';
+    var resolvedRank = String(rank || (matchedProfile ? matchedProfile.rank : '') || '').trim();
+    var resolvedUnit = String(unit || (matchedProfile ? matchedProfile.units : '') || '').trim();
+    var fallbackName = String(name || '').trim();
+
+    var displayName = '';
+    if (matchedProfile && matchedProfile.fullName) {
+      displayName = String(matchedProfile.fullName || '').trim();
+    }
+
+    if (!displayName && firstName && lastName) {
+      displayName = [resolvedRank, lastName, firstName].filter(Boolean).join(' ').trim();
+    }
+
+    if (!displayName) {
+      displayName = [resolvedRank, fallbackName].filter(Boolean).join(' ').trim();
+    }
+
+    return {
+      id: String(recordId),
+      timestamp: String(timeOut || timeIn || ''),
+      personnelId: personnelId,
+      name: displayName || 'Unknown Personnel',
+      firstName: firstName,
+      lastName: lastName,
+      rank: resolvedRank,
+      unit: resolvedUnit,
+      timeIn: String(timeIn || ''),
+      timeOut: String(timeOut || ''),
+      remarks: String(remarks || '').trim(),
+      scanLocation: scanLocation,
+      status: normalizeLogStatusForApi(remarks, !!timeOut),
+      source: source,
+    };
+  });
+}
+
+function getScriptUrl() {
+  return ScriptApp.getService().getUrl();
+}
+
+function getSpreadsheet() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    if (ss) return ss;
+    return SpreadsheetApp.openById('PASTE_YOUR_SPREADSHEET_ID_HERE');
+  } catch (e) {
+    throw new Error('Unable to open spreadsheet: ' + e.message);
+  }
+}
+
+/**
+ * checkUser(userId)
+ * Fetches ALL necessary data to be temporarily stored on the frontend
+ */
+function checkUserV2(userId) {
+  try {
+    const ss = getSpreadsheet();
+    const logSheet = ss.getSheetByName(SHEET_NAMES.rawLog);
+    const includeDailyStatus = arguments.length > 1 ? Boolean(arguments[1]) : true;
+    
+    if (!logSheet) return { exists: false, error: 'Required sheets not found' };
+
+    const scannedId = normalizeAccountNumber(userId);
+    const scannedToken = normalizeLookupToken(userId);
+    if (!scannedId) return { exists: false, error: 'Empty ID scanned' };
+    const lookup = getProfileLookup();
+    
+    let userProfile = { 
+      accountNumber: '',
+      rank: '',
+      lastName: '',
+      firstName: '',
+      middleName: '',
+      suffix: '',
+      fullName: '',
+      units: '',
+      adminOp: '',
+      photoUrl: '',
+    };
+    let profileFound = false;
+    let scannedPreview = Array.isArray(lookup.samples) ? lookup.samples : [];
+    const matchedProfile = findProfileInLookup(lookup, scannedId, scannedToken);
+
+    if (matchedProfile) {
+      userProfile = {
+        accountNumber: matchedProfile.accountNumber,
+        rank: matchedProfile.rank,
+        lastName: matchedProfile.lastName,
+        firstName: matchedProfile.firstName,
+        middleName: matchedProfile.middleName,
+        suffix: matchedProfile.suffix,
+        fullName: matchedProfile.fullName,
+        units: matchedProfile.units,
+        adminOp: matchedProfile.adminOp,
+        photoUrl: matchedProfile.photoUrl,
+      };
+      profileFound = true;
+    }
+
+    if (!profileFound) {
+      return {
+        exists: false,
+        error: 'Account ' + userId + ' not found.',
+        details: {
+          scannedIdRaw: String(userId || ''),
+          scannedIdNormalized: scannedId,
+          scannedToken: scannedToken,
+          accountColumnIndex: lookup.profileColumns ? lookup.profileColumns.accountNumber : PROFILE_COLUMNS.accountNumber,
+          qrCodeColumnIndex: lookup.profileColumns ? lookup.profileColumns.qrCode : 8,
+          sampleAccountNumbers: scannedPreview,
+        },
+      };
+    }
+
+    if (!includeDailyStatus) {
+      return {
+        exists: true,
+        hasTimeIn: false,
+        hasTimeOut: false,
+        timeIn: null,
+        dailyScanCount: 0,
+        profile: userProfile,
+        userId: userId,
+        accountNumber: userProfile.accountNumber,
+      };
+    }
+
+    const logDataRaw = logSheet.getDataRange().getValues();
+    let logStatus = { exists: false, hasTimeIn: false, hasTimeOut: false, timeIn: null, dailyScanCount: 0 };
+    const todayKey = getGmt8DayKey(new Date());
+
+    for (let i = logDataRaw.length - 1; i > 0; i--) {
+      const rowId = normalizeAccountNumber(logDataRaw[i][RAW_LOG_COLUMNS.id]);
+      const rowDateVal = logDataRaw[i][RAW_LOG_COLUMNS.timeIn];
+
+      if (rowId === scannedId && rowDateVal instanceof Date && getGmt8DayKey(rowDateVal) === todayKey) {
+        logStatus.dailyScanCount += 1;
+        const timeOutVal = logDataRaw[i][3];
+        logStatus = {
+          dailyScanCount: logStatus.dailyScanCount,
+          exists: true,
+          hasTimeIn: true,
+          hasTimeOut: (timeOutVal instanceof Date && !isNaN(timeOutVal.getTime())),
+          timeIn: rowDateVal.toISOString()
+        };
+      }
+    }
+
+    return { ...logStatus, profile: userProfile, userId: userId, accountNumber: userProfile.accountNumber };
+
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+/**
+ * logAttendance(userId, action, clientProfile)
+ * NOW ACCEPTS 'clientProfile' directly from the frontend and scanLocation.
+ * This guarantees that if the UI shows it, the DB saves it.
+ */
+function logAttendance(userId, clientProfile, scanLocation) {
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.rawLog);
+    
+    if (!sheet) {
+      return {
+        ok: false,
+        code: 'CONFIG_ERROR',
+        message: 'Sheet not found',
+        details: { sheet: SHEET_NAMES.rawLog },
+      };
+    }
+
+    const scannedId = normalizeAccountNumber(userId);
+    const now = new Date();
+    const todayKey = getGmt8DayKey(now);
+    const TIME_FORMAT = "M/d/yyyy H:mm:ss";
+
+    const dataRaw = sheet.getDataRange().getValues();
+    let openRowIndex = -1;
+    let closedRowsCount = 0;
+    let matchedRowsCount = 0;
+    let consecutiveOlderRows = 0;
+
+    for (let i = dataRaw.length - 1; i > 0; i--) {
+      const rowId = normalizeAccountNumber(dataRaw[i][RAW_LOG_COLUMNS.id]);
+      const rowDateVal = dataRaw[i][RAW_LOG_COLUMNS.timeIn];
+
+      if (!(rowDateVal instanceof Date) || isNaN(rowDateVal.getTime())) {
+        continue;
+      }
+
+      const rowDayKey = getGmt8DayKey(rowDateVal);
+      if (rowDayKey < todayKey) {
+        consecutiveOlderRows += 1;
+        if (consecutiveOlderRows >= 30) {
+          break;
+        }
+      } else {
+        consecutiveOlderRows = 0;
+      }
+
+      if (rowId !== scannedId || rowDayKey !== todayKey) {
+        continue;
+      }
+
+      matchedRowsCount += 1;
+      const existingTimeout = dataRaw[i][RAW_LOG_COLUMNS.timeOut];
+      const hasTimeout = existingTimeout instanceof Date && !isNaN(existingTimeout.getTime());
+
+      if (hasTimeout) {
+        closedRowsCount += 1;
+      } else if (openRowIndex < 0) {
+        openRowIndex = i + 1;
+      }
+    }
+
+    const normalizedProfile = clientProfile || {
+      rank: '',
+      lastName: '',
+      firstName: '',
+      units: '',
+      adminOp: '',
+      photoUrl: '',
+      fullName: '',
+      accountNumber: '',
+    };
+
+    if (matchedRowsCount === 0) {
+      const lastRow = sheet.getLastRow();
+      const nextRow = lastRow + 1;
+
+      const displayName =
+        [normalizedProfile.lastName, normalizedProfile.firstName].filter(Boolean).join(', ').trim() ||
+        normalizedProfile.fullName ||
+        normalizedProfile.lastName ||
+        '';
+
+      const newRow = new Array(10).fill('');
+      newRow[0] = Utilities.getUuid();
+      newRow[RAW_LOG_COLUMNS.id] = normalizedProfile.accountNumber || userId;
+      newRow[RAW_LOG_COLUMNS.timeIn] = now;
+      newRow[RAW_LOG_COLUMNS.timeOut] = '';
+      newRow[RAW_LOG_COLUMNS.remarks] = 'On-Duty';
+      newRow[RAW_LOG_COLUMNS.image] = normalizedProfile.photoUrl || '';
+      newRow[RAW_LOG_COLUMNS.unit] = normalizedProfile.units || '';
+      newRow[RAW_LOG_COLUMNS.adminOp] = normalizedProfile.adminOp || '';
+      newRow[RAW_LOG_COLUMNS.rank] = normalizedProfile.rank || '';
+      newRow[RAW_LOG_COLUMNS.name] = displayName;
+
+      sheet.getRange(nextRow, 1, 1, 10).setValues([newRow]);
+      sheet.getRange(nextRow, RAW_LOG_COLUMNS.timeIn + 1).setNumberFormat(TIME_FORMAT);
+      writeScanLocationToRawRow(sheet, nextRow, 'timein', scanLocation);
+      SpreadsheetApp.flush();
+      invalidateLogsCache();
+
+      return {
+        ok: true,
+        action: 'timein',
+        status: 'On-Duty',
+        message: 'Time-in recorded successfully.',
+        time: now.toISOString(),
+        referenceId: newRow[0],
+      };
+    }
+
+    if (matchedRowsCount === 1 && openRowIndex > 0 && closedRowsCount === 0) {
+      sheet.getRange(openRowIndex, RAW_LOG_COLUMNS.timeOut + 1).setValue(now).setNumberFormat(TIME_FORMAT);
+      sheet.getRange(openRowIndex, RAW_LOG_COLUMNS.remarks + 1).setValue('Off-Duty');
+      writeScanLocationToRawRow(sheet, openRowIndex, 'timeout', scanLocation);
+      SpreadsheetApp.flush();
+      invalidateLogsCache();
+
+      return {
+        ok: true,
+        action: 'timeout',
+        status: 'Off-Duty',
+        message: 'Time-out recorded successfully.',
+        time: now.toISOString(),
+        referenceId: String(sheet.getRange(openRowIndex, 1).getValue() || Utilities.getUuid()),
+      };
+    }
+
+    return {
+      ok: false,
+      code: 'INVALID_TRANSITION',
+      message: 'Daily scan limit reached. Only two valid scans per day are allowed.',
+      details: {
+        accountNumber: userId,
+        dayKeyGmt8: todayKey,
+        matchedRowsCount: matchedRowsCount,
+        closedRowsCount: closedRowsCount,
+      },
+    };
+
+  } catch (e) {
+    return {
+      ok: false,
+      code: 'SCAN_PROCESS_FAILED',
+      message: 'Failed to persist attendance record.',
+      details: String(e),
+    };
+  }
+}
+
+// ... archiveAttendanceData() and getAttendanceLogs() remain the same ...
+function archiveAttendanceData() {
+  const ss = getSpreadsheet();
+  const sourceSheet = ss.getSheetByName(SHEET_NAMES.rawLog);
+  const archiveSheet = ss.getSheetByName(SHEET_NAMES.archive);
+
+  if (!sourceSheet || !archiveSheet) {
+    return {
+      ok: false,
+      code: 'CONFIG_ERROR',
+      message: 'Required archive sheets are missing.',
+      details: {
+        rawLog: !!sourceSheet,
+        archive: !!archiveSheet,
+      },
+    };
+  }
+
+  const rawLastRow = sourceSheet.getLastRow();
+  if (rawLastRow < 2) {
+    return {
+      ok: true,
+      message: 'No raw records to archive.',
+      summary: {
+        scannedRows: 0,
+        eligibleRows: 0,
+        insertedRows: 0,
+        duplicateRowsSkipped: 0,
+        retainedRows: 0,
+        clearedRows: 0,
+      },
+    };
+  }
+
+  const rawData = sourceSheet.getRange(2, 1, rawLastRow - 1, 10).getValues();
+  const rawRowsWithIndex = rawData.map(function (row, idx) {
+    return { rowIndex: idx + 2, row: row };
+  });
+
+  const todayKey = getGmt8DayKey(new Date());
+  const eligibleRows = rawRowsWithIndex.filter(function (entry) {
+    const rawTimeIn = entry.row[RAW_LOG_COLUMNS.timeIn];
+    let timeInDate = null;
+
+    if (rawTimeIn instanceof Date && !isNaN(rawTimeIn.getTime())) {
+      timeInDate = rawTimeIn;
+    } else if (rawTimeIn) {
+      const parsed = new Date(rawTimeIn);
+      if (!isNaN(parsed.getTime())) {
+        timeInDate = parsed;
+      }
+    }
+
+    if (!timeInDate) {
+      return false;
+    }
+
+    const timeInDayKey = getGmt8DayKey(timeInDate);
+    // For testing, allow archiving records dated up to and including today
+    return timeInDayKey <= todayKey;
+  });
+
+  if (eligibleRows.length === 0) {
+    return {
+      ok: true,
+      message: 'No eligible raw records found for archival.',
+      summary: {
+        scannedRows: rawRowsWithIndex.length,
+        eligibleRows: 0,
+        insertedRows: 0,
+        duplicateRowsSkipped: 0,
+        retainedRows: rawRowsWithIndex.length,
+        clearedRows: 0,
+      },
+    };
+  }
+
+  const archiveLastRow = archiveSheet.getLastRow();
+  const existingArchiveIds = {};
+
+  if (archiveLastRow >= 2) {
+    const archiveIdColumn = archiveSheet.getRange(2, 1, archiveLastRow - 1, 1).getValues();
+    archiveIdColumn.forEach(function (row) {
+      const key = String(row[0] || '').trim();
+      if (key) {
+        existingArchiveIds[key] = true;
+      }
+    });
+  }
+
+  const rowsToInsert = [];
+  const rawRowIndexesToClear = [];
+  let duplicateRowsSkipped = 0;
+
+  eligibleRows.forEach(function (entry) {
+    const raw = entry.row;
+    const recordId = String(raw[0] || '').trim();
+
+    if (!recordId) {
+      return;
+    }
+
+    if (existingArchiveIds[recordId]) {
+      duplicateRowsSkipped += 1;
+      rawRowIndexesToClear.push(entry.rowIndex);
+      return;
+    }
+
+    rowsToInsert.push([
+      raw[0],
+      raw[1],
+      raw[2],
+      raw[3],
+      raw[4],
+      raw[6],
+      raw[7],
+      raw[8],
+      raw[9],
+    ]);
+    existingArchiveIds[recordId] = true;
+    rawRowIndexesToClear.push(entry.rowIndex);
+  });
+
+  if (rowsToInsert.length > 0) {
+    const insertStartRow = archiveSheet.getLastRow() + 1;
+    archiveSheet.getRange(insertStartRow, 1, rowsToInsert.length, 9).setValues(rowsToInsert);
+  }
+
+  clearRawRowsByIndex(sourceSheet, rawRowIndexesToClear);
+  SpreadsheetApp.flush();
+  invalidateLogsCache();
+
+  return {
+    ok: true,
+    message: 'Archival process completed.',
+    summary: {
+      scannedRows: rawRowsWithIndex.length,
+      eligibleRows: eligibleRows.length,
+      insertedRows: rowsToInsert.length,
+      duplicateRowsSkipped: duplicateRowsSkipped,
+      retainedRows: rawRowsWithIndex.length - rawRowIndexesToClear.length,
+      clearedRows: rawRowIndexesToClear.length,
+      dayBoundaryTimezone: 'GMT+8',
+      transferRule: 'Archive only rows with Time-In date before current GMT+8 day',
+    },
+  };
+}
+
+function clearRawRowsByIndex(rawSheet, rowIndexes) {
+  if (!rowIndexes || rowIndexes.length === 0) {
+    return;
+  }
+
+  const sortedUnique = Array.from(new Set(rowIndexes)).sort(function (a, b) { return a - b; });
+
+  sortedUnique.forEach(function (rowNumber) {
+    rawSheet.getRange(rowNumber, 1, 1, 10).clearContent();
+  });
+}
+
+function runDailyRawToArchiveTransfer() {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    return archiveAttendanceData();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function ensureDailyArchiveTrigger() {
+  const handler = 'runDailyRawToArchiveTransfer';
+  const allTriggers = ScriptApp.getProjectTriggers();
+
+  allTriggers.forEach(function (trigger) {
+    if (trigger.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyDays(1)
+    .atHour(7)
+    .create();
+
+  return {
+    ok: true,
+    message: 'Daily archive trigger ensured for 7:00 project timezone.',
+    handler: handler,
+    schedule: {
+      type: 'time-driven',
+      everyDays: 1,
+      atHour: 7,
+    },
+  };
+}
+
+function getAttendanceLogs() {
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName('Attendance_Archive'); 
+    if (!sheet) return [];
+    const data = sheet.getDataRange().getValues();
+    return data.length > 1 ? data.slice(1) : []; 
+  } catch (e) { return []; }
+}
+
+function getRawAttendanceLogs() {
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.rawLog);
+    if (!sheet) return [];
+    const data = sheet.getDataRange().getValues();
+    return data.length > 1 ? data.slice(1) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function doPut(e) {
+  return jsonError('METHOD_NOT_ALLOWED', 'HTTP PUT is not supported for this API.', {
+    method: 'PUT',
+    route: getRequestRoute(e),
+  });
+}
+
+function doDelete(e) {
+  return jsonError('METHOD_NOT_ALLOWED', 'HTTP DELETE is not supported for this API.', {
+    method: 'DELETE',
+    route: getRequestRoute(e),
+  });
+}
+
+function getPersonnelRecords() {
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.profile);
+    if (!sheet) return [];
+    const data = sheet.getDataRange().getValues();
+    return data.length > 1 ? data.slice(1) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function getLeaveRecords() {
+  try {
+    const ss = getSpreadsheet();
+    const sheet = ss.getSheetByName(SHEET_NAMES.leave);
+    if (!sheet) return [];
+    const data = sheet.getDataRange().getValues();
+    return data.length > 1 ? data.slice(1) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function normalizeIsoDate(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const parsed = new Date(raw);
+  if (isNaN(parsed.getTime())) return '';
+
+  return Utilities.formatDate(parsed, 'GMT+8', 'yyyy-MM-dd');
+}
+
+function normalizeLeaveStatus(value) {
+  const raw = String(value || '').trim().toLowerCase();
+
+  if (!raw) return 'Approved';
+  if (raw.includes('pending')) return 'Pending';
+  if (raw.includes('reject') || raw.includes('denied')) return 'Rejected';
+  if (raw.includes('approve') || raw.includes('spl') || raw.includes('wellnes') || raw.includes('vacation') || raw.includes('sick')) {
+    return 'Approved';
+  }
+
+  return 'Approved';
+}
+
+function transformPersonnelToApiItems(rows) {
+  return rows
+    .map(function (row) {
+      const accountNumber = String(row[0] || '').trim();
+      if (!accountNumber) return null;
+
+      return {
+        accountNumber: accountNumber,
+        rank: String(row[1] || '').trim(),
+        lastName: String(row[2] || '').trim(),
+        firstName: String(row[3] || '').trim(),
+        middleName: String(row[4] || '').trim(),
+        designation: String(row[5] || '').trim(),
+        unit: String(row[6] || '').trim(),
+        photoUrl: String(row[9] || '').trim(),
+      };
+    })
+    .filter(function (item) { return item !== null; });
+}
+
+function transformLeavesToApiItems(rows) {
+  return rows
+    .map(function (row, index) {
+      const accountNumber = String(row[0] || '').trim();
+      const rank = String(row[1] || '').trim();
+      const lastName = String(row[2] || '').trim();
+      const firstName = String(row[3] || '').trim();
+      const leaveType = String(row[4] || '').trim();
+      const startDate = normalizeIsoDate(row[5]);
+      const endDate = normalizeIsoDate(row[6]);
+      const reason = String(row[7] || '').trim();
+      const status = normalizeLeaveStatus(String(row[8] || row[4] || '').trim());
+
+      if (!accountNumber || !startDate || !endDate) {
+        return null;
+      }
+
+      return {
+        id: 'leave-' + (index + 1),
+        personnelName: [rank, lastName, firstName].filter(Boolean).join(' ').trim(),
+        accountNumber: accountNumber,
+        rank: rank,
+        leaveType: leaveType || 'Leave',
+        startDate: startDate,
+        endDate: endDate,
+        reason: reason,
+        status: status,
+      };
+    })
+    .filter(function (item) { return item !== null; });
+}
+
+function findProfileForScanV3(scannedId) {
+  try {
+    const scannedIdNormalized = normalizeAccountNumber(scannedId);
+    const scannedToken = normalizeLookupToken(scannedId);
+    if (!scannedIdNormalized) {
+      return null;
+    }
+
+    const lookup = getProfileLookup();
+    const matched = findProfileInLookup(lookup, scannedIdNormalized, scannedToken);
+    if (matched) {
+      return {
+        accountNumber: matched.accountNumber,
+        rank: matched.rank,
+        lastName: matched.lastName,
+        firstName: matched.firstName,
+        middleName: matched.middleName,
+        suffix: matched.suffix,
+        fullName: matched.fullName,
+        units: matched.units,
+        adminOp: matched.adminOp,
+        photoUrl: matched.photoUrl,
+      };
+    }
+
+    return null;
+  } catch (error) {
+    return null;
+  }
+}

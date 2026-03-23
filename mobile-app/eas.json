@@ -1,0 +1,25 @@
+{
+  "cli": {
+    "version": ">= 10.0.0"
+  },
+  "build": {
+    "preview": {
+      "channel": "preview",
+      "distribution": "internal",
+      "env": {
+        "EXPO_PUBLIC_API_MODE": "live",
+        "EXPO_PUBLIC_APPS_SCRIPT_BASE_URL": "https://script.google.com/macros/s/AKfycbxkvpfS_b3tDuCsgtO_t6xnNonuoe8WgyFYGt1Z6yl6L49eR-DCcO042CJJAl3clBRm6g/exec",
+        "EXPO_PUBLIC_API_TIMEOUT_MS": "15000"
+      },
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "channel": "production",
+      "android": {
+        "buildType": "app-bundle"
+      }
+    }
+  }
+}
