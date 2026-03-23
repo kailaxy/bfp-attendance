@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Archive, Clock, Clock3, Filter, Search, ShieldCheck, TriangleAlert } from 'lucide-react'
+import { Archive, Clock, Clock3, Filter, Search, TriangleAlert } from 'lucide-react'
 import { attendanceApi } from '../services'
 import { getRelativeTime } from '../utils/timeDisplay'
 
@@ -127,14 +127,48 @@ const toDisplayName = (entry) => {
   )
 }
 
+const toStatusLabel = (status) => {
+  const normalized = normalizeStatus(status)
+
+  if (normalized === 'IN') {
+    return 'On-Duty'
+  }
+
+  if (normalized === 'OUT') {
+    return 'Off-Duty'
+  }
+
+  return (status || '').toString().trim() || 'Unknown'
+}
+
 const normalizeEntry = (entry, sourceHint) => {
   const status = normalizeStatus(entry?.status)
-  const timeIn = entry?.timeIn || ''
-  const timeOut = entry?.timeOut || ''
+  const timeIn = (
+    entry?.timeIn ||
+    entry?.time_in ||
+    entry?.timeInAt ||
+    entry?.checkIn ||
+    ''
+  ).toString()
+  const timeOut = (
+    entry?.timeOut ||
+    entry?.time_out ||
+    entry?.timeOutAt ||
+    entry?.checkOut ||
+    ''
+  ).toString()
   const timestamp = entry?.timestamp || timeOut || timeIn || ''
   const parsedTimestamp = toDateSafe(timestamp)
   const explicitSource = normalizeSourceLabel(entry?.source)
   const source = explicitSource || sourceHint || inferSourceLabel(parsedTimestamp)
+  const statusLabel = toStatusLabel(entry?.status)
+  const scanLocationValue =
+    entry?.scanLocation?.locationLabel ||
+    entry?.scanLocationLabel ||
+    entry?.locationLabel ||
+    entry?.scanLocation ||
+    entry?.location ||
+    ''
 
   return {
     id: entry?.id || entrySignature(entry),
@@ -143,8 +177,8 @@ const normalizeEntry = (entry, sourceHint) => {
     unit: entry?.unit || entry?.units || entry?.UNITS || '',
     timeIn,
     timeOut,
-    remarks: (entry?.remarks || '').toString().trim(),
-    scanLocation: (entry?.scanLocation || entry?.location || '').toString().trim(),
+    remarks: (entry?.remarks || entry?.remark || statusLabel).toString().trim(),
+    scanLocation: scanLocationValue.toString().trim(),
     status,
     timestamp,
     source,
@@ -241,9 +275,8 @@ const groupEntriesToRows = (entries) => {
       source: row.source,
       timeIn: row.timeIn,
       timeOut: row.timeOut,
-      remarks: row.remarks || '—',
+      remarks: row.remarks || (row.timeOut ? 'Off-Duty' : row.timeIn ? 'On-Duty' : toStatusLabel(row.latestStatus)),
       scanLocation: row.scanLocation || '—',
-      status: row.timeOut ? 'Off-Duty' : row.timeIn ? 'On-Duty' : row.latestStatus || 'Unknown',
       latestTimestamp: row.latestTimestamp,
     }))
     .sort((a, b) => {
@@ -284,20 +317,6 @@ const sourceModeLabel = (mode) => {
   }
 
   return 'Single Feed'
-}
-
-const rowStatusTone = (status) => {
-  const normalized = (status || '').toLowerCase()
-
-  if (normalized.includes('on-duty') || normalized === 'in') {
-    return 'bg-status-success-soft text-status-success'
-  }
-
-  if (normalized.includes('off-duty') || normalized === 'out') {
-    return 'bg-status-warning-soft text-status-warning'
-  }
-
-  return 'bg-status-info-soft text-status-info'
 }
 
 const AttendanceLogsPage = () => {
@@ -406,7 +425,7 @@ const AttendanceLogsPage = () => {
         return true
       }
 
-      return [row.personnelId, row.name, row.unit, row.status, row.remarks, row.scanLocation]
+      return [row.personnelId, row.name, row.unit, row.remarks, row.scanLocation]
         .join(' ')
         .toLowerCase()
         .includes(search)
@@ -518,9 +537,6 @@ const AttendanceLogsPage = () => {
                     Time-Out
                   </th>
                   <th className="px-3 py-2 text-left text-meta font-semibold uppercase tracking-wide text-text-muted">
-                    Status
-                  </th>
-                  <th className="px-3 py-2 text-left text-meta font-semibold uppercase tracking-wide text-text-muted">
                     Remarks
                   </th>
                   <th className="px-3 py-2 text-left text-meta font-semibold uppercase tracking-wide text-text-muted">
@@ -547,14 +563,6 @@ const AttendanceLogsPage = () => {
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-text-body">
                       {toTimeDisplay(row.timeOut)}
-                    </td>
-                    <td className="whitespace-nowrap px-3 py-2">
-                      <span
-                        className={`inline-flex items-center rounded-badge px-2.5 py-1 text-meta font-semibold ${rowStatusTone(row.status)}`}
-                      >
-                        <ShieldCheck size={12} className="mr-1" />
-                        {row.status}
-                      </span>
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-text-body">{row.remarks}</td>
                     <td className="px-3 py-2 text-text-body">{row.scanLocation}</td>
