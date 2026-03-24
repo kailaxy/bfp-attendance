@@ -138,12 +138,6 @@ const toGoogleMapsSearchUrl = (coordinates) => {
   return `https://www.google.com/maps/search/?api=1&query=${query}`
 }
 
-const toMapPreviewImageUrl = (coordinates) => {
-  const lat = coordinates.latitude.toFixed(7)
-  const lon = coordinates.longitude.toFixed(7)
-  return `https://staticmap.openstreetmap.de/staticmap.php?center=${lat},${lon}&zoom=17&size=280x150&markers=${lat},${lon},red-pushpin`
-}
-
 const entrySignature = (entry) => {
   const id = entry?.id || ''
   const personnelId = entry?.personnelId || ''
@@ -614,34 +608,17 @@ const AttendanceLogsPage = () => {
                         }
 
                         const googleMapsUrl = toGoogleMapsSearchUrl(coordinates)
-                        const previewImageUrl = toMapPreviewImageUrl(coordinates)
 
                         return (
-                          <div className="space-y-1.5">
-                            <a
-                              href={googleMapsUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="font-semibold text-brand-primary underline decoration-brand-primary/40 underline-offset-2 hover:text-brand-primary-hover"
-                              title="Open coordinates in Google Maps"
-                            >
-                              {coordinates.normalized}
-                            </a>
-                            <a
-                              href={googleMapsUrl}
-                              target="_blank"
-                              rel="noreferrer"
-                              className="block w-fit overflow-hidden rounded-control border border-brand-secondary/20"
-                              title="Open map preview in Google Maps"
-                            >
-                              <img
-                                src={previewImageUrl}
-                                alt={`Map preview for ${coordinates.normalized}`}
-                                loading="lazy"
-                                className="h-[75px] w-[140px] object-cover"
-                              />
-                            </a>
-                          </div>
+                          <a
+                            href={googleMapsUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="font-semibold text-brand-primary underline decoration-brand-primary/40 underline-offset-2 hover:text-brand-primary-hover"
+                            title="Open coordinates in Google Maps"
+                          >
+                            {coordinates.normalized}
+                          </a>
                         )
                       })()}
                     </td>

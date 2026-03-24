@@ -962,7 +962,7 @@ function transformLogsToApiItems(rows, sourceType) {
       unit = String(row[5] || '');
       rank = String(row[7] || '');
       name = String(row[8] || '');
-      scanLocation = String(row[10] || '').trim();
+      scanLocation = String(row[9] || row[10] || '').trim();
     }
 
     var scannedId = normalizeAccountNumber(personnelId);
@@ -1311,7 +1311,7 @@ function archiveAttendanceData() {
     };
   }
 
-  const rawData = sourceSheet.getRange(2, 1, rawLastRow - 1, 10).getValues();
+  const rawData = sourceSheet.getRange(2, 1, rawLastRow - 1, 11).getValues();
   const rawRowsWithIndex = rawData.map(function (row, idx) {
     return { rowIndex: idx + 2, row: row };
   });
@@ -1395,6 +1395,7 @@ function archiveAttendanceData() {
       raw[7],
       raw[8],
       raw[9],
+      raw[10],
     ]);
     existingArchiveIds[recordId] = true;
     rawRowIndexesToClear.push(entry.rowIndex);
@@ -1402,7 +1403,7 @@ function archiveAttendanceData() {
 
   if (rowsToInsert.length > 0) {
     const insertStartRow = archiveSheet.getLastRow() + 1;
-    archiveSheet.getRange(insertStartRow, 1, rowsToInsert.length, 9).setValues(rowsToInsert);
+    archiveSheet.getRange(insertStartRow, 1, rowsToInsert.length, 10).setValues(rowsToInsert);
   }
 
   clearRawRowsByIndex(sourceSheet, rawRowIndexesToClear);
@@ -1433,7 +1434,7 @@ function clearRawRowsByIndex(rawSheet, rowIndexes) {
   const sortedUnique = Array.from(new Set(rowIndexes)).sort(function (a, b) { return a - b; });
 
   sortedUnique.forEach(function (rowNumber) {
-    rawSheet.getRange(rowNumber, 1, 1, 10).clearContent();
+    rawSheet.getRange(rowNumber, 1, 1, 11).clearContent();
   });
 }
 
