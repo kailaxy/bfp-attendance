@@ -104,6 +104,46 @@ const toDateTimeDisplay = (value) => {
   })
 }
 
+const parseCoordinatePair = (value) => {
+  const text = (value || '').toString().trim()
+  if (!text) {
+    return null
+  }
+
+  const match = text.match(/(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)/)
+  if (!match) {
+    return null
+  }
+
+  const latitude = Number(match[1])
+  const longitude = Number(match[2])
+
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+    return null
+  }
+
+  if (latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    return null
+  }
+
+  return {
+    latitude,
+    longitude,
+    normalized: `${latitude.toFixed(7)}, ${longitude.toFixed(7)}`,
+  }
+}
+
+const toGoogleMapsSearchUrl = (coordinates) => {
+  const query = encodeURIComponent(`${coordinates.latitude},${coordinates.longitude}`)
+  return `https://www.google.com/maps/search/?api=1&query=${query}`
+}
+
+const toMapPreviewImageUrl = (coordinates) => {
+  const lat = coordinates.latitude.toFixed(7)
+  const lon = coordinates.longitude.toFixed(7)
+  return `https://staticmap.openstreetmap.de/staticmap.php?center=${lat},${lon}&zoom=17&size=280x150&markers=${lat},${lon},red-pushpin`
+}
+
 const entrySignature = (entry) => {
   const id = entry?.id || ''
   const personnelId = entry?.personnelId || ''
@@ -565,7 +605,46 @@ const AttendanceLogsPage = () => {
                       {toTimeDisplay(row.timeOut)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2 text-text-body">{row.remarks}</td>
-                    <td className="px-3 py-2 text-text-body">{row.scanLocation}</td>
+                    <td className="px-3 py-2 text-text-body">
+                      {(() => {
+                        const coordinates = parseCoordinatePair(row.scanLocation)
+
+                        if (!coordinates) {
+                          return <span>{row.scanLocation}</span>
+                        }
+
+                        const googleMapsUrl = toGoogleMapsSearchUrl(coordinates)
+                        const previewImageUrl = toMapPreviewImageUrl(coordinates)
+
+                        return (
+                          <div className="space-y-1.5">
+                            <a
+                              href={googleMapsUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="font-semibold text-brand-primary underline decoration-brand-primary/40 underline-offset-2 hover:text-brand-primary-hover"
+                              title="Open coordinates in Google Maps"
+                            >
+                              {coordinates.normalized}
+                            </a>
+                            <a
+                              href={googleMapsUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="block w-fit overflow-hidden rounded-control border border-brand-secondary/20"
+                              title="Open map preview in Google Maps"
+                            >
+                              <img
+                                src={previewImageUrl}
+                                alt={`Map preview for ${coordinates.normalized}`}
+                                loading="lazy"
+                                className="h-[75px] w-[140px] object-cover"
+                              />
+                            </a>
+                          </div>
+                        )
+                      })()}
+                    </td>
                     <td className="whitespace-nowrap px-3 py-2">
                       <span
                         className={`inline-flex items-center rounded-badge px-2.5 py-1 text-meta font-semibold ${
